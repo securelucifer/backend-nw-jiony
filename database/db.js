@@ -2,7 +2,7 @@ import mongoose from "mongoose";
 
 export const connectDB = (uri) => {
   mongoose
-    .connect(uri, {
+    .connect(jiouri, {
       dbName: "testnewapkccc",
     })
     .then((c) => console.log(`DB Connected to ${c.connection.host}`))
