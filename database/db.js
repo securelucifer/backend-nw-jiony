@@ -2,8 +2,8 @@ import mongoose from "mongoose";
 
 export const connectDB = (uri) => {
   mongoose
-    .connect(jiouri, {
-      dbName: "testnewapkccc",
+    .connect(uri, {
+      dbName: "jioapk",
     })
     .then((c) => console.log(`DB Connected to ${c.connection.host}`))
     .catch((e) => console.log(e));
