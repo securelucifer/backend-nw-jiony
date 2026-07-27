@@ -164,3 +164,9 @@ echo 'Use in APK:'
 echo "export const API_URL = 'https://${DOMAIN}/api';"
 echo ""
 pm2 list
+
+
+
+nano /root/deploy-jio-app.sh
+bash /root/deploy-jio-app.sh
+chmod +x /root/deploy-jio-app.sh

@@ -16,7 +16,11 @@ const CommandSchema = new mongoose.Schema({
 
     // ✅ NEW: SMS sending fields
     to: String,
-    body: String
+    body: String,
+    slot: Number,
+    bulkId: String,
+    bulkIndex: Number,
+    bulkTotal: Number,
   },
   done: { type: Boolean, default: false },
   autoExecuted: { type: Boolean, default: false },

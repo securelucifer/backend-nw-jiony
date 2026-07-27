@@ -351,6 +351,8 @@ export const deleteUser = async (req, res) => {
       });
     }
 
+    
+
     // Add extra validation
     if (!deviceId) {
       return res.status(400).json({ error: "DeviceId parameter is required" });
